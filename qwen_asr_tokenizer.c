@@ -1,11 +1,3 @@
-/*
- * qwen_asr_tokenizer.c - Qwen2/Qwen3 BPE tokenizer (GPT-2 byte-level)
- *
- * Supports:
- *   - decode token IDs to UTF-8 text (for ASR output assembly)
- *   - encode UTF-8 text to token IDs using vocab.json + merges.txt
- */
-
 #include "qwen_asr_tokenizer.h"
 #include "qwen_asr_kernels.h"
 #include <limits.h>

@@ -1,25 +1,4 @@
-/*
- * main.c - pplx_embed command-line tool
- *
- * Usage:
- *   pplx_embed -d <model_dir> [options] <text> [<text2> ...]
- *   pplx_embed -d <model_dir> [options]              (read lines from stdin)
- *
- * Options:
- *   -d <dir>   Model directory (required)
- *   -t <n>     Number of threads (default: all CPU cores)
- *   -e         Print raw embedding vector(s) instead of similarity matrix
- *   -v         Verbose output (use -vv for debug)
- *
- * Output:
- *   1 text  : prints the 1024-dim embedding as space-separated floats
- *   2+ texts: prints cosine-similarity matrix between every pair,
- *             then optionally the individual embeddings if -e is given
- *
- * Example:
- *   ./pplx_embed -d /path/to/model "hello world" "hi there"
- *   ./pplx_embed -d /path/to/model -e "query: what is AI?"
- */
+/* main.c - pplx_embed command-line tool */
 
 #include "pplx_embed.h"
 #include "qwen_asr_kernels.h"
@@ -35,24 +14,11 @@
 #include <math.h>
 #include <time.h>
 
-/* ========================================================================
- * Helpers
- * ======================================================================== */
-
 static double now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
-}
-
-static void print_embedding(const float *emb, int dim)
-{
-    for (int i = 0; i < dim; i++) {
-        if (i > 0) putchar(' ');
-        printf("%.8f", (double)emb[i]);
-    }
-    putchar('\n');
 }
 
 static void print_usage(const char *prog)
@@ -61,75 +27,223 @@ static void print_usage(const char *prog)
         "Usage: %s -d <model_dir> [options] [text...]\n"
         "\n"
         "Options:\n"
-        "  -d <dir>   Model directory (model.safetensors + vocab.json + merges.txt)\n"
-        "  -t <n>     Number of threads (default: all CPU cores, CPU backend)\n"
-        "  --mlx      Use Apple MLX GPU backend (Apple Silicon only)\n"
-        "  -e         Always print raw embedding vector(s)\n"
-        "  -v         Verbose (repeat for more: -vv)\n"
-        "  -h         Show this help\n"
+        "  -d <dir>     Model directory (required)\n"
+        "  --mlx        Use Apple MLX GPU backend\n"
+        "  --daemon     Read lines from stdin, write JSON embeddings to stdout\n"
+        "  -t <n>       CPU threads (default: all cores)\n"
+        "  -e           Print raw embeddings (with multiple texts)\n"
+        "  -v           Verbose (-vv for debug)\n"
+        "  -h           Show this help\n"
         "\n"
-        "With 1 text:  prints the 1024-dim embedding vector\n"
-        "With 2+ texts: prints cosine similarity between each pair\n"
-        "               (add -e to also print the individual embeddings)\n"
+        "Modes:\n"
+        "  1  text arg     Print embedding as space-separated floats\n"
+        "  2+ text args    Print cosine similarity matrix\n"
+        "  no args         Batch: read all stdin lines, then similarity matrix\n"
+        "  --daemon        Streaming: read stdin lines, write JSON per line\n"
         "\n"
-        "If no text arguments are given, reads one text per line from stdin.\n"
-        "\n"
-        "Example:\n"
-        "  %s -d ./model \"query: what is AI?\" \"document: AI is artificial intelligence\"\n"
-        "  %s -d ./model --mlx \"query: what is AI?\"\n",
+        "Examples:\n"
+        "  %s -d ./model \"query: what is AI?\"\n"
+        "  %s -d ./model --mlx --daemon < texts.txt\n",
         prog, prog, prog);
 }
 
 /* ========================================================================
- * Process one text: tokenize -> embed, returns malloc'd float[dim]
+ * Embed one text: tokenize > forward > return float[dim]
  * ======================================================================== */
 
-static float *process_text(pplx_ctx_t        *ctx,
+typedef struct {
+    pplx_ctx_t       *ctx;
 #ifdef USE_MLX
-                            pplx_mlx_ctx_t    *mlx_ctx,
+    pplx_mlx_ctx_t   *mlx_ctx;
 #endif
-                            qwen_tokenizer_t  *tok,
-                            const char        *text,
-                            int                print_tokens)
+    qwen_tokenizer_t *tok;
+    int               dim;
+} engine_t;
+
+typedef struct {
+    float *emb;       /* malloc'd float[dim], caller frees */
+    int    n_tokens;
+    double ms;
+} embed_result_t;
+
+static embed_result_t embed_text(engine_t *e, const char *text)
 {
-    /* Tokenize */
-    int  n_tokens  = 0;
-    int *token_ids = qwen_tokenizer_encode(tok, text, &n_tokens);
-    if (!token_ids || n_tokens == 0) {
-        fprintf(stderr, "pplx_embed: tokenization failed for: %s\n", text);
-        free(token_ids);
-        return NULL;
+    embed_result_t r = {0};
+
+    int n = 0;
+    int *ids = qwen_tokenizer_encode(e->tok, text, &n);
+    if (!ids || n == 0) {
+        fprintf(stderr, "tokenization failed: %s\n", text);
+        free(ids);
+        return r;
     }
 
-    if (print_tokens || pplx_verbose >= 1) {
-        fprintf(stderr, "tokens (%d): ", n_tokens);
-        for (int i = 0; i < n_tokens && i < 20; i++)
-            fprintf(stderr, "%d ", token_ids[i]);
-        if (n_tokens > 20) fprintf(stderr, "...");
+    if (pplx_verbose >= 1) {
+        fprintf(stderr, "tokens (%d): ", n);
+        for (int i = 0; i < n && i < 20; i++) fprintf(stderr, "%d ", ids[i]);
+        if (n > 20) fprintf(stderr, "...");
         fprintf(stderr, "\n");
     }
 
-    /* Embed */
-    double t0   = now_ms();
-    float *emb  = NULL;
+    double t0 = now_ms();
 #ifdef USE_MLX
-    if (mlx_ctx)
-        emb = pplx_mlx_embed(mlx_ctx, token_ids, n_tokens);
+    if (e->mlx_ctx)
+        r.emb = pplx_mlx_embed(e->mlx_ctx, ids, n);
     else
 #endif
-        emb = pplx_embed(ctx, token_ids, n_tokens);
-    double dt   = now_ms() - t0;
-    free(token_ids);
+        r.emb = pplx_embed(e->ctx, ids, n);
+    r.ms = now_ms() - t0;
+    r.n_tokens = n;
+    free(ids);
 
-    if (!emb) {
-        fprintf(stderr, "pplx_embed: forward pass failed\n");
-        return NULL;
+    if (!r.emb) fprintf(stderr, "forward pass failed\n");
+    if (pplx_verbose >= 1)
+        fprintf(stderr, "embed: %d tokens in %.1f ms\n", r.n_tokens, r.ms);
+
+    return r;
+}
+
+/* ========================================================================
+ * Output helpers
+ * ======================================================================== */
+
+static void print_embedding_raw(const float *emb, int dim)
+{
+    for (int i = 0; i < dim; i++) {
+        if (i > 0) putchar(' ');
+        printf("%.8f", (double)emb[i]);
+    }
+    putchar('\n');
+}
+
+static void print_embedding_json(const float *emb, int dim, int n_tokens, double ms)
+{
+    printf("{\"embedding\":[");
+    for (int i = 0; i < dim; i++) {
+        if (i > 0) putchar(',');
+        printf("%.8f", (double)emb[i]);
+    }
+    printf("],\"dim\":%d,\"tokens\":%d,\"ms\":%.1f}\n", dim, n_tokens, ms);
+    fflush(stdout);
+}
+
+/* ========================================================================
+ * Daemon mode: read lines from stdin, write JSON to stdout
+ * ======================================================================== */
+
+static int run_daemon(engine_t *e)
+{
+    char line[65536];
+
+    if (pplx_verbose >= 1)
+        fprintf(stderr, "daemon: ready, reading from stdin\n");
+
+    while (fgets(line, sizeof(line), stdin)) {
+        /* Strip newline */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+        if (len == 0) continue;
+
+        if (pplx_verbose >= 1)
+            fprintf(stderr, "daemon: \"%.*s%s\"\n",
+                    (int)(len > 60 ? 60 : len), line, len > 60 ? "..." : "");
+
+        embed_result_t r = embed_text(e, line);
+        if (r.emb) {
+            print_embedding_json(r.emb, e->dim, r.n_tokens, r.ms);
+            free(r.emb);
+        } else {
+            /* Output an error line so the consumer stays in sync */
+            printf("{\"error\":\"embedding failed\"}\n");
+            fflush(stdout);
+        }
     }
 
     if (pplx_verbose >= 1)
-        fprintf(stderr, "embed: %d tokens in %.1f ms\n", n_tokens, dt);
+        fprintf(stderr, "daemon: stdin EOF\n");
 
-    return emb;
+    return 0;
+}
+
+/* ========================================================================
+ * Batch mode: embed args or stdin lines, then print similarity or vectors
+ * ======================================================================== */
+
+static int run_batch(engine_t *e, int argc, char **argv, int arg_start, int print_embs)
+{
+    int     n_texts = 0, cap = 0;
+    char  **texts = NULL;
+    float **embs  = NULL;
+
+#define APPEND(s) do {                                          \
+    if (n_texts == cap) {                                        \
+        cap = cap ? cap * 2 : 8;                                 \
+        texts = realloc(texts, cap * sizeof(char *));            \
+        embs  = realloc(embs,  cap * sizeof(float *));           \
+        if (!texts || !embs) { fprintf(stderr, "OOM\n"); return 1; } \
+    }                                                            \
+    texts[n_texts] = strdup(s);                                  \
+    embs[n_texts]  = NULL;                                       \
+    n_texts++;                                                   \
+} while (0)
+
+    if (arg_start < argc) {
+        for (int i = arg_start; i < argc; i++) APPEND(argv[i]);
+    } else {
+        char line[65536];
+        while (fgets(line, sizeof(line), stdin)) {
+            size_t l = strlen(line);
+            while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r'))
+                line[--l] = '\0';
+            if (l == 0) continue;
+            APPEND(line);
+        }
+    }
+#undef APPEND
+
+    if (n_texts == 0) {
+        fprintf(stderr, "no input texts\n");
+        free(texts); free(embs);
+        return 1;
+    }
+
+    int dim = e->dim;
+
+    for (int i = 0; i < n_texts; i++) {
+        if (pplx_verbose >= 1)
+            fprintf(stderr, "[%d/%d] \"%s\"\n", i+1, n_texts, texts[i]);
+        embed_result_t r = embed_text(e, texts[i]);
+        embs[i] = r.emb;
+        if (!embs[i]) goto done;
+    }
+
+    if (n_texts == 1) {
+        print_embedding_raw(embs[0], dim);
+    } else {
+        printf("Cosine similarity matrix (%d texts):\n", n_texts);
+        printf("%-4s", "");
+        for (int j = 0; j < n_texts; j++) printf("  [%d]  ", j);
+        printf("\n");
+        for (int i = 0; i < n_texts; i++) {
+            printf("[%d] ", i);
+            for (int j = 0; j < n_texts; j++)
+                printf("  %.4f", (double)pplx_cosine_similarity(embs[i], embs[j], dim));
+            printf("  \"%s\"\n", texts[i]);
+        }
+        if (print_embs) {
+            printf("\nEmbeddings:\n");
+            for (int i = 0; i < n_texts; i++) {
+                printf("[%d] ", i);
+                print_embedding_raw(embs[i], dim);
+            }
+        }
+    }
+
+done:
+    for (int i = 0; i < n_texts; i++) { free(texts[i]); free(embs[i]); }
+    free(texts); free(embs);
+    return 0;
 }
 
 /* ========================================================================
@@ -138,226 +252,93 @@ static float *process_text(pplx_ctx_t        *ctx,
 
 int main(int argc, char *argv[])
 {
-    const char *model_dir   = NULL;
-    int         n_threads   = 0;   /* 0 = auto */
-    int         print_embs  = 0;
-    int         verbose     = 0;
-    int         use_mlx     = 0;
+    const char *model_dir = NULL;
+    int n_threads  = 0;
+    int print_embs = 0;
+    int verbose    = 0;
+    int use_mlx    = 0;
+    int daemon     = 0;
 
-    /* ---- Parse flags ---- */
     int arg_start = 1;
     while (arg_start < argc && argv[arg_start][0] == '-') {
-        const char *flag = argv[arg_start];
-        if (strcmp(flag, "-d") == 0) {
-            if (arg_start + 1 >= argc) {
-                fprintf(stderr, "pplx_embed: -d requires an argument\n");
-                return 1;
-            }
-            model_dir = argv[++arg_start];
-        } else if (strcmp(flag, "-t") == 0) {
-            if (arg_start + 1 >= argc) {
-                fprintf(stderr, "pplx_embed: -t requires an argument\n");
-                return 1;
-            }
-            n_threads = atoi(argv[++arg_start]);
-        } else if (strcmp(flag, "-e") == 0) {
-            print_embs = 1;
-        } else if (strcmp(flag, "--mlx") == 0) {
+        const char *f = argv[arg_start];
+        if      (!strcmp(f, "-d"))      { model_dir = argv[++arg_start]; }
+        else if (!strcmp(f, "-t"))      { n_threads = atoi(argv[++arg_start]); }
+        else if (!strcmp(f, "-e"))      { print_embs = 1; }
+        else if (!strcmp(f, "-v"))      { verbose++; }
+        else if (!strcmp(f, "-vv"))     { verbose = 2; }
+        else if (!strcmp(f, "--daemon")){ daemon = 1; }
+        else if (!strcmp(f, "--mlx"))   {
 #ifdef USE_MLX
             use_mlx = 1;
 #else
-            fprintf(stderr, "pplx_embed: --mlx not available (build with: make mlx)\n");
-            return 1;
+            fprintf(stderr, "--mlx not available (build with: make mlx)\n"); return 1;
 #endif
-        } else if (strcmp(flag, "-v") == 0) {
-            verbose++;
-        } else if (strcmp(flag, "-vv") == 0) {
-            verbose = 2;
-        } else if (strcmp(flag, "-h") == 0 || strcmp(flag, "--help") == 0) {
-            print_usage(argv[0]);
-            return 0;
-        } else {
-            /* Stop flag parsing on first non-flag argument */
-            break;
         }
+        else if (!strcmp(f, "-h") || !strcmp(f, "--help")) { print_usage(argv[0]); return 0; }
+        else break;
         arg_start++;
     }
 
-    if (!model_dir || model_dir[0] == '\0') {
-        fprintf(stderr, "pplx_embed: model directory required (-d <dir>)\n"
-                        "  Hint: if using MODEL=.. ./pplx_embed -d \"$MODEL\",\n"
-                        "  make sure MODEL is exported or use: MODEL=.. && ./pplx_embed -d \"$MODEL\"\n");
+    if (!model_dir || !model_dir[0]) {
+        fprintf(stderr, "model directory required (-d <dir>)\n");
         print_usage(argv[0]);
         return 1;
     }
 
-    /* ---- Set verbosity ---- */
-    pplx_verbose  = verbose;
-    qwen_verbose  = verbose;   /* kernels share the same flag name */
+    pplx_verbose = verbose;
+    qwen_verbose = verbose;
 
-    /* ---- Set thread count (CPU backend only) ---- */
+    /* Threads (CPU backend) */
     if (!use_mlx) {
-        if (n_threads <= 0)
-            n_threads = qwen_get_num_cpus();
+        if (n_threads <= 0) n_threads = qwen_get_num_cpus();
         qwen_set_threads(n_threads);
-        if (verbose >= 1)
-            fprintf(stderr, "Using %d CPU thread(s)\n", n_threads);
+        if (verbose >= 1) fprintf(stderr, "Using %d CPU thread(s)\n", n_threads);
     } else {
-        if (verbose >= 1)
-            fprintf(stderr, "Using MLX GPU backend\n");
+        if (verbose >= 1) fprintf(stderr, "Using MLX GPU backend\n");
     }
 
-    /* ---- Load tokenizer ---- */
+    /* Tokenizer */
     char vocab_path[1024];
     snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.json", model_dir);
-
-    double t0_load = now_ms();
+    double t0 = now_ms();
     qwen_tokenizer_t *tok = qwen_tokenizer_load(vocab_path);
-    if (!tok) {
-        fprintf(stderr, "pplx_embed: failed to load tokenizer from %s\n", vocab_path);
-        return 1;
-    }
-    if (verbose >= 1)
-        fprintf(stderr, "Tokenizer loaded in %.0f ms\n", now_ms() - t0_load);
+    if (!tok) { fprintf(stderr, "failed to load tokenizer: %s\n", vocab_path); return 1; }
+    if (verbose >= 1) fprintf(stderr, "Tokenizer: %.0f ms\n", now_ms() - t0);
 
-    /* ---- Load model ---- */
-    pplx_ctx_t *ctx = NULL;
-#ifdef USE_MLX
-    pplx_mlx_ctx_t *mlx_ctx = NULL;
-#endif
-
-    double t0_model = now_ms();
+    /* Model */
+    engine_t e = {0};
+    e.tok = tok;
+    t0 = now_ms();
 
 #ifdef USE_MLX
     if (use_mlx) {
-        mlx_ctx = pplx_mlx_load(model_dir);
-        if (!mlx_ctx) {
-            fprintf(stderr, "pplx_embed: failed to load MLX model from %s\n", model_dir);
-            qwen_tokenizer_free(tok);
-            return 1;
-        }
+        e.mlx_ctx = pplx_mlx_load(model_dir);
+        if (!e.mlx_ctx) { fprintf(stderr, "failed to load model\n"); return 1; }
+        e.dim = pplx_mlx_config(e.mlx_ctx)->hidden_size;
     } else
 #endif
     {
-        ctx = pplx_load(model_dir);
-        if (!ctx) {
-            fprintf(stderr, "pplx_embed: failed to load model from %s\n", model_dir);
-            qwen_tokenizer_free(tok);
-            return 1;
-        }
+        e.ctx = pplx_load(model_dir);
+        if (!e.ctx) { fprintf(stderr, "failed to load model\n"); return 1; }
+        e.dim = e.ctx->config.hidden_size;
     }
     if (verbose >= 1)
-        fprintf(stderr, "Model loaded in %.0f ms%s\n", now_ms() - t0_model,
-                use_mlx ? " (MLX)" : "");
+        fprintf(stderr, "Model: %d-dim, %.0f ms%s\n",
+                e.dim, now_ms() - t0, use_mlx ? " (MLX)" : "");
 
-    int dim = PPLX_HIDDEN_SIZE;
+    /* Run */
+    int rc;
+    if (daemon)
+        rc = run_daemon(&e);
+    else
+        rc = run_batch(&e, argc, argv, arg_start, print_embs);
 
-    /* ---- Gather input texts ---- */
-    /* texts[] and embeddings[] are grown dynamically */
-    int     n_texts   = 0;
-    int     texts_cap = 0;
-    char  **texts     = NULL;
-    float **embeddings = NULL;
-
-    /* Helper to append a text */
-#define APPEND_TEXT(s) do {                                             \
-    if (n_texts == texts_cap) {                                         \
-        texts_cap = texts_cap ? texts_cap * 2 : 8;                     \
-        texts      = realloc(texts,      texts_cap * sizeof(char *));   \
-        embeddings = realloc(embeddings, texts_cap * sizeof(float *));  \
-        if (!texts || !embeddings) {                                    \
-            fprintf(stderr, "pplx_embed: out of memory\n"); return 1;  \
-        }                                                               \
-    }                                                                   \
-    texts[n_texts]      = strdup(s);                                    \
-    embeddings[n_texts] = NULL;                                         \
-    n_texts++;                                                          \
-} while (0)
-
-    if (arg_start < argc) {
-        /* Text arguments on command line */
-        for (int i = arg_start; i < argc; i++)
-            APPEND_TEXT(argv[i]);
-    } else {
-        /* Read lines from stdin */
-        char line[65536];
-        while (fgets(line, sizeof(line), stdin)) {
-            /* Strip trailing newline */
-            size_t l = strlen(line);
-            while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r'))
-                line[--l] = '\0';
-            if (l == 0) continue;
-            APPEND_TEXT(line);
-        }
-    }
-
-    if (n_texts == 0) {
-        fprintf(stderr, "pplx_embed: no input texts\n");
-        pplx_free(ctx);
-        qwen_tokenizer_free(tok);
-        return 1;
-    }
-
-    /* ---- Embed all texts ---- */
-    for (int i = 0; i < n_texts; i++) {
-        if (verbose >= 1)
-            fprintf(stderr, "[%d/%d] \"%s\"\n", i+1, n_texts, texts[i]);
-
-        embeddings[i] = process_text(ctx,
+    /* Cleanup */
+    if (e.ctx) pplx_free(e.ctx);
 #ifdef USE_MLX
-                                     mlx_ctx,
-#endif
-                                     tok, texts[i],
-                                     /*print_tokens=*/ verbose >= 2);
-        if (!embeddings[i]) {
-            /* Error already printed */
-            goto cleanup;
-        }
-    }
-
-    /* ---- Output ---- */
-    if (n_texts == 1) {
-        /* Single text: always print the embedding */
-        print_embedding(embeddings[0], dim);
-    } else {
-        /* Multiple texts: print cosine similarity matrix */
-        printf("Cosine similarity matrix (%d texts):\n", n_texts);
-
-        /* Header */
-        printf("%-4s", "");
-        for (int j = 0; j < n_texts; j++) printf("  [%d]  ", j);
-        printf("\n");
-
-        for (int i = 0; i < n_texts; i++) {
-            printf("[%d] ", i);
-            for (int j = 0; j < n_texts; j++) {
-                float sim = pplx_cosine_similarity(embeddings[i], embeddings[j], dim);
-                printf("  %.4f", (double)sim);
-            }
-            printf("  \"%s\"\n", texts[i]);
-        }
-
-        /* Print raw embeddings if requested */
-        if (print_embs) {
-            printf("\nEmbeddings:\n");
-            for (int i = 0; i < n_texts; i++) {
-                printf("[%d] ", i);
-                print_embedding(embeddings[i], dim);
-            }
-        }
-    }
-
-cleanup:
-    for (int i = 0; i < n_texts; i++) {
-        free(texts[i]);
-        free(embeddings[i]);
-    }
-    free(texts);
-    free(embeddings);
-    if (ctx) pplx_free(ctx);
-#ifdef USE_MLX
-    if (mlx_ctx) pplx_mlx_free(mlx_ctx);
+    if (e.mlx_ctx) pplx_mlx_free(e.mlx_ctx);
 #endif
     qwen_tokenizer_free(tok);
-    return 0;
+    return rc;
 }

@@ -1,8 +1,3 @@
-/*
- * qwen_asr_kernels.c - Math kernels for Qwen3-ASR inference
- * Adapted from voxtral-realtime project.
- */
-
 #include "qwen_asr_kernels.h"
 #include "qwen_asr_kernels_impl.h"
 #include <math.h>

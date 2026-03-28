@@ -1,7 +1,4 @@
-# pplx_embed - Pure C inference for perplexity-ai/pplx-embed-v1-0.6b
-# Makefile
-
-CC     = gcc
+CC          = gcc
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
 LDFLAGS     = -lm -lpthread
 
@@ -27,7 +24,7 @@ TARGET   = pplx_embed
 all: help
 
 help:
-	@echo "pplx_embed - Pure C inference for pplx-embed-v1-0.6b"
+	@echo "pplx_embed - Inference for pplx-embed-v1 and pplx-embed-context-v1 embedding models"
 	@echo ""
 	@echo "Build targets:"
 	@echo "  make blas     Build with BLAS acceleration (CPU)"
@@ -35,7 +32,7 @@ help:
 	@echo "  make debug    Debug build with AddressSanitizer"
 	@echo "  make clean    Remove build artifacts"
 	@echo ""
-	@echo "Usage after build:"
+	@echo "Usage:"
 	@echo "  ./pplx_embed -d /path/to/model-dir \"text1\" \"text2\""
 	@echo "  ./pplx_embed -d /path/to/model-dir --mlx \"text1\" \"text2\"  (if built with make mlx)"
 
@@ -52,8 +49,6 @@ endif
 blas:
 	$(MAKE) clean
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)"
-	@echo ""
-	@echo "Built: $(TARGET) (CPU/BLAS)"
 
 # =============================================================================
 # MLX build (Apple Silicon GPU - uses mlx-c pure C API)
@@ -75,8 +70,6 @@ endif
 mlx:
 	$(MAKE) clean
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" EXTRA_OBJS="pplx_embed_mlx.o"
-	@echo ""
-	@echo "Built: $(TARGET) (CPU/BLAS + MLX GPU, use --mlx flag)"
 
 # =============================================================================
 # Debug build
